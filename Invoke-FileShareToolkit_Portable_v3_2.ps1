@@ -911,7 +911,7 @@ Depth uses the corporate model: server is level 1, share is level 2, first folde
 </section>
 </main>
 
-<script id="fst-data" type="application/json">
+<script id="fst-data" type="text/plain">
 __FST_DATA_PLACEHOLDER__
 </script>
 <script>
@@ -928,6 +928,21 @@ function rowsOf(value) {
 if (Array.isArray(value)) return value;
 if (value === null || value === undefined) return [];
 return [value];
+}
+
+function decodeBase64Utf8(value) {
+const binary = atob(String(value || "").trim());
+if (window.TextDecoder) {
+const bytes = new Uint8Array(binary.length);
+for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+return new TextDecoder("utf-8").decode(bytes);
+}
+
+let escaped = "";
+for (let i = 0; i < binary.length; i++) {
+escaped += "%" + ("00" + binary.charCodeAt(i).toString(16)).slice(-2);
+}
+return decodeURIComponent(escaped);
 }
 
 function renderCards() {
@@ -1927,7 +1942,7 @@ menu.classList.add("hidden");
 
 function load() {
 try {
-const raw = document.getElementById("fst-data").textContent;
+const raw = decodeBase64Utf8(document.getElementById("fst-data").textContent);
 DATA = JSON.parse(raw);
 ensureUserAccessRows();
 const sourceText = DATA.meta.sourceJsonFiles ? ` | JSON files: ${DATA.meta.sourceJsonFiles}` : "";
@@ -2447,6 +2462,67 @@ Export-CsvSafe -Data @(Get-JsonArrayProperty -Object $Data -Name "userAccess") -
 Export-CsvSafe -Data @(Get-JsonArrayProperty -Object $Data -Name "robocopyPlan") -Name "Robocopy_Migration_Plan.csv" | Out-Null
 }
 
+function ConvertTo-DashboardSafeString {
+param([AllowNull()][string]$Value)
+
+if ($null -eq $Value) { return $null }
+
+$builder = New-Object System.Text.StringBuilder
+foreach ($ch in $Value.ToCharArray()) {
+$code = [int][char]$ch
+if ($code -lt 32) {
+[void]$builder.Append(" ")
+}
+else {
+[void]$builder.Append($ch)
+}
+}
+
+return $builder.ToString()
+}
+
+function ConvertTo-DashboardSafeObject {
+param([object]$Value)
+
+if ($null -eq $Value) { return $null }
+if ($Value -is [string]) { return ConvertTo-DashboardSafeString -Value $Value }
+if ($Value -is [System.ValueType]) { return $Value }
+
+if ($Value -is [System.Collections.IDictionary]) {
+$hash = [ordered]@{}
+foreach ($key in $Value.Keys) {
+$hash[$key] = ConvertTo-DashboardSafeObject -Value $Value[$key]
+}
+return $hash
+}
+
+if ($Value -is [System.Collections.IEnumerable]) {
+$items = New-Object System.Collections.Generic.List[object]
+foreach ($item in $Value) {
+$items.Add((ConvertTo-DashboardSafeObject -Value $item))
+}
+return ,@($items.ToArray())
+}
+
+$object = [ordered]@{}
+foreach ($property in $Value.PSObject.Properties) {
+try {
+$object[$property.Name] = ConvertTo-DashboardSafeObject -Value $property.Value
+}
+catch {
+$object[$property.Name] = $null
+}
+}
+return $object
+}
+
+function ConvertTo-DashboardJson {
+param([object]$Data)
+
+$safeData = ConvertTo-DashboardSafeObject -Value $Data
+return ($safeData | ConvertTo-Json -Depth 12 -Compress)
+}
+
 function Write-DashboardHtmlFile {
 param(
 [string]$HtmlPath,
@@ -2455,9 +2531,11 @@ param(
 
 New-DashboardHtml -HtmlPath $HtmlPath
 
-# Embed JSON directly into Dashboard.html so it works from file:// without browser fetch restrictions.
+# Embed Base64 JSON so file:// dashboards are not broken by raw control characters or HTML parsing.
 $htmlContent = Get-Content -LiteralPath $HtmlPath -Raw -Encoding UTF8
-$htmlContent = $htmlContent.Replace("__FST_DATA_PLACEHOLDER__", $Json)
+$jsonBytes = [System.Text.Encoding]::UTF8.GetBytes($Json)
+$encodedJson = [Convert]::ToBase64String($jsonBytes)
+$htmlContent = $htmlContent.Replace("__FST_DATA_PLACEHOLDER__", $encodedJson)
 Set-Content -LiteralPath $HtmlPath -Value $htmlContent -Encoding UTF8
 }
 
@@ -2761,7 +2839,7 @@ $centralData.meta["localConfigSaveEndpoint"] = $centralConfigSaveServer.Endpoint
 $centralData.meta["localConfigSaveServerCommand"] = $centralConfigSaveServer.CommandFileName
 $centralData.meta["configTargetPath"] = $centralConfigSaveServer.TargetConfigPath
 }
-$centralJson = $centralData | ConvertTo-Json -Depth 10
+$centralJson = ConvertTo-DashboardJson -Data $centralData
 $centralJsonPath = Join-Path $CentralJsonPath "data.json"
 $centralJson | Set-Content -Path $centralJsonPath -Encoding UTF8
 
@@ -2890,7 +2968,7 @@ $data.meta["configTargetPath"] = $configSaveServer.TargetConfigPath
 }
 
 $jsonPath = Join-Path $RunRoot "data.json"
-$json = $data | ConvertTo-Json -Depth 10
+$json = ConvertTo-DashboardJson -Data $data
 $json | Set-Content -Path $jsonPath -Encoding UTF8
 
 $centralCopyPath = Copy-DataJsonToCentral -JsonPath $jsonPath -DestinationPath $CentralJsonPath -ServerName $Server -CurrentRunId $RunId -KeepHistory:$KeepCentralRunHistory
