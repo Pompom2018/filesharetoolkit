@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FileShareToolkit Dashboard</title>
+<style>
+:root { color-scheme: dark; --bg:#0f172a; --panel:#111827; --text:#e5e7eb; --muted:#9ca3af; --border:#374151; --accent:#60a5fa; }
+* { box-sizing:border-box; }
+body { margin:0; font-family:Segoe UI,Arial,sans-serif; background:var(--bg); color:var(--text); }
+main { max-width:900px; margin:0 auto; padding:48px 24px; }
+.panel { background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:22px; }
+h1 { margin:0 0 10px; font-size:28px; }
+p { color:var(--muted); line-height:1.55; }
+code, pre { background:#020617; color:var(--text); border:1px solid var(--border); border-radius:8px; }
+code { padding:2px 5px; }
+pre { padding:14px; overflow:auto; }
+a { color:var(--accent); }
+</style>
+</head>
+<body>
+<main>
+<div class="panel">
+<h1>FileShareToolkit Dashboard</h1>
+<p>This GitHub Pages placeholder is safe to publish because it does not include audit data.</p>
+<p>To publish the real central dashboard here, generate it into <code>docs/index.html</code>:</p>
+<pre><code>.\Invoke-FileShareToolkit_Portable_v3_2.ps1 `
+  -GenerateCentralDashboard `
+  -CentralJsonPath \\auditserver\ShareAudit\Json `
+  -GitHubPagesPath .\docs</code></pre>
+<p>Only publish the generated dashboard when the embedded file share, ACL, user, and risk data is approved for the page audience.</p>
+</div>
+</main>
+</body>
+</html>

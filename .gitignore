@@ -1,0 +1,21 @@
+# Local audit outputs
+Run_*/
+*.log
+CentralDashboard_*.log
+
+# Generated central data files
+data_*.json
+data.json
+Summary.csv
+SMB_Shares.csv
+SMB_Share_Permissions.csv
+NTFS_ACLs.csv
+Migration_Risk_Assessment.csv
+User_Access.csv
+Robocopy_Migration_Plan.csv
+
+# Local helper files generated beside dashboards
+Generate-CentralDashboard.cmd
+Start-ConfigSaveServer.cmd
+ConfigSaveServer.ps1
+
