@@ -201,6 +201,59 @@ $flags.Add("PossibleDirectUserOrNonStandardGroup")
 return (($flags | Sort-Object -Unique) -join ";")
 }
 
+function Get-AclRemediationAdvice {
+param(
+[string]$RiskFlags,
+[string]$ScanStatus,
+[string]$Error,
+[string]$IdentityReference,
+[string]$AccessControlType,
+[string]$FileSystemRights
+)
+
+$advice = New-Object System.Collections.Generic.List[string]
+$flags = [string]$RiskFlags
+$errorText = [string]$Error
+
+if ($ScanStatus -eq "Failed" -or $flags -match "AclReadDenied|EnumerationFailed" -or $errorText -match "Access is denied|UnauthorizedAccess|permission") {
+$advice.Add("Access denied: do not reset ACLs. First back up permissions with icacls /save. Run PowerShell elevated or as the file server local admin/SYSTEM. If still blocked, take ownership only on the affected object, preferably to the Administrators group, then add a temporary admin ACE; this preserves the existing DACL instead of replacing it.")
+}
+
+if ($flags -match "PathNotFound") {
+$advice.Add("Path not found: verify the share path, mount point, DFS target, and service account visibility before changing permissions.")
+}
+
+if ($flags -match "OrphanedSID") {
+$advice.Add("Orphaned SID: identify whether the SID maps to a deleted or migrated account. If it is obsolete, remove only that ACE after an ACL backup; if it belongs to a migrated identity, replace it with the correct current group.")
+}
+
+if ($flags -match "BrokenInheritance") {
+$advice.Add("Broken inheritance: review why inheritance was disabled before enabling it. If the folder should follow the parent model, document explicit ACEs, back up ACLs, then re-enable inheritance and convert or remove duplicate explicit ACEs deliberately.")
+}
+
+if ($flags -match "BroadPrincipal") {
+$advice.Add("Broad principal: replace Everyone, Authenticated Users, or BUILTIN\\Users with the smallest approved domain group. Validate share permissions and NTFS permissions together before removal.")
+}
+
+if ($flags -match "DenyACE") {
+$advice.Add("Deny ACE: check whether the deny is intentional. Prefer removing the user/group from an allow group rather than relying on deny ACEs, because deny entries override allows and often cause troubleshooting issues.")
+}
+
+if ($flags -match "FullControlACE") {
+$advice.Add("Full Control: reduce to Modify or Read/Execute for normal users where possible. Keep Full Control limited to service/admin groups that own the data management process.")
+}
+
+if ($flags -match "PossibleDirectUserOrNonStandardGroup") {
+$advice.Add("Direct user or non-standard group: move access to a named role-based group, then remove the direct user ACE after validation. This keeps future cleanup and ownership transfer manageable.")
+}
+
+if ($advice.Count -eq 0 -and -not [string]::IsNullOrWhiteSpace($flags)) {
+$advice.Add("Review this ACL manually. Back up ACLs before changing permissions and prefer additive test changes over replacing the whole DACL.")
+}
+
+return (($advice | Sort-Object -Unique) -join " ")
+}
+
 function Get-FolderStats {
 param([string]$Path)
 
@@ -388,6 +441,7 @@ IsInherited = $null
 InheritanceFlags = $null
 PropagationFlags = $null
 RiskFlags = "PathNotFound"
+SuggestedFix = Get-AclRemediationAdvice -RiskFlags "PathNotFound" -ScanStatus "Failed" -Error "Path not found or inaccessible" -IdentityReference $null -AccessControlType $null -FileSystemRights $null
 ScanStatus = "Failed"
 Error = "Path not found or inaccessible"
 })
@@ -430,6 +484,7 @@ IsInherited = $null
 InheritanceFlags = $null
 PropagationFlags = $null
 RiskFlags = "EnumerationFailed"
+SuggestedFix = Get-AclRemediationAdvice -RiskFlags "EnumerationFailed" -ScanStatus "Failed" -Error $_.Exception.Message -IdentityReference $null -AccessControlType $null -FileSystemRights $null
 ScanStatus = "Failed"
 Error = $_.Exception.Message
 })
@@ -442,6 +497,7 @@ $acl = Get-Acl -LiteralPath $item.FullName -ErrorAction Stop
 $itemDepth = Get-Depth -Root $share.SharePath -Current $item.FullName
 
 foreach ($ace in $acl.Access) {
+$riskFlags = Get-AceRiskFlags -Acl $acl -Ace $ace
 $rows.Add([pscustomobject]@{
 Server = $share.Server
 ShareName = $share.ShareName
@@ -458,7 +514,8 @@ FileSystemRights = [string]$ace.FileSystemRights
 IsInherited = [string]$ace.IsInherited
 InheritanceFlags = [string]$ace.InheritanceFlags
 PropagationFlags = [string]$ace.PropagationFlags
-RiskFlags = Get-AceRiskFlags -Acl $acl -Ace $ace
+RiskFlags = $riskFlags
+SuggestedFix = Get-AclRemediationAdvice -RiskFlags $riskFlags -ScanStatus "Success" -Error $null -IdentityReference ([string]$ace.IdentityReference.Value) -AccessControlType ([string]$ace.AccessControlType) -FileSystemRights ([string]$ace.FileSystemRights)
 ScanStatus = "Success"
 Error = $null
 })
@@ -482,6 +539,7 @@ IsInherited = $null
 InheritanceFlags = $null
 PropagationFlags = $null
 RiskFlags = "AclReadDenied"
+SuggestedFix = Get-AclRemediationAdvice -RiskFlags "AclReadDenied" -ScanStatus "Failed" -Error $_.Exception.Message -IdentityReference $null -AccessControlType $null -FileSystemRights $null
 ScanStatus = "Failed"
 Error = $_.Exception.Message
 })
@@ -644,6 +702,7 @@ AccessControlType = [string]$perm.AccessControlType
 AccessRights = [string]$perm.AccessRight
 IsInherited = $null
 RiskFlags = $riskFlags
+SuggestedFix = Get-AclRemediationAdvice -RiskFlags $riskFlags -ScanStatus ([string]$perm.Status) -Error $perm.Error -IdentityReference $principal -AccessControlType ([string]$perm.AccessControlType) -FileSystemRights ([string]$perm.AccessRight)
 Status = [string]$perm.Status
 Error = $perm.Error
 })
@@ -664,6 +723,7 @@ AccessControlType = [string]$acl.AccessControlType
 AccessRights = [string]$acl.FileSystemRights
 IsInherited = [string]$acl.IsInherited
 RiskFlags = [string]$acl.RiskFlags
+SuggestedFix = [string]$acl.SuggestedFix
 Status = [string]$acl.ScanStatus
 Error = $acl.Error
 })
@@ -930,6 +990,36 @@ if (value === null || value === undefined) return [];
 return [value];
 }
 
+function suggestedFixForRow(row) {
+const flags = String(row.RiskFlags || "");
+const status = String(row.ScanStatus || row.Status || "");
+const error = String(row.Error || "");
+const advice = [];
+
+if (status === "Failed" || /AclReadDenied|EnumerationFailed/.test(flags) || /Access is denied|UnauthorizedAccess|permission/i.test(error)) {
+advice.push("Access denied: do not reset ACLs. Back up permissions with icacls /save, run elevated or as local admin/SYSTEM, then take ownership only on the affected object and add a temporary admin ACE if needed.");
+}
+if (/PathNotFound/.test(flags)) advice.push("Verify the share path, mount point, DFS target, and account visibility before changing permissions.");
+if (/OrphanedSID/.test(flags)) advice.push("Identify whether the SID is obsolete or migrated. Remove only that ACE after backup, or replace it with the correct current group.");
+if (/BrokenInheritance/.test(flags)) advice.push("Review why inheritance is disabled. If it should follow the parent, document explicit ACEs, back up ACLs, then re-enable inheritance deliberately.");
+if (/BroadPrincipal/.test(flags)) advice.push("Replace broad principals with the smallest approved domain group after validating share and NTFS permissions together.");
+if (/DenyACE/.test(flags)) advice.push("Confirm the deny is intentional. Prefer removing a user from an allow group instead of relying on deny ACEs.");
+if (/FullControlACE/.test(flags)) advice.push("Reduce Full Control to Modify or Read/Execute for normal users; reserve Full Control for service/admin groups.");
+if (/PossibleDirectUserOrNonStandardGroup/.test(flags)) advice.push("Move access to a role-based group, validate, then remove the direct user or non-standard ACE.");
+
+if (advice.length === 0 && flags) advice.push("Review manually. Back up ACLs first and prefer additive test changes over replacing the whole DACL.");
+return [...new Set(advice)].join(" ");
+}
+
+function ensureSuggestedFixes() {
+rowsOf(DATA.ntfsAcls).forEach(row => {
+if (!row.SuggestedFix) row.SuggestedFix = suggestedFixForRow(row);
+});
+rowsOf(DATA.userAccess).forEach(row => {
+if (!row.SuggestedFix) row.SuggestedFix = suggestedFixForRow(row);
+});
+}
+
 function decodeBase64Utf8(value) {
 const binary = atob(String(value || "").trim());
 if (window.TextDecoder) {
@@ -1041,7 +1131,8 @@ cols:[
 {key:"ScanDepth", title:"Scan Depth"},
 {key:"IdentityReference", title:"Identity"}, {key:"AccessControlType", title:"Type"},
 {key:"FileSystemRights", title:"Rights"}, {key:"IsInherited", title:"Inherited"},
-{key:"RiskFlags", title:"Risk"}, {key:"ScanStatus", title:"Status"}, {key:"Error", title:"Error"}
+{key:"RiskFlags", title:"Risk"}, {key:"SuggestedFix", title:"Suggested Fix"},
+{key:"ScanStatus", title:"Status"}, {key:"Error", title:"Error"}
 ]
 },
 perms: {
@@ -1065,7 +1156,7 @@ cols:[
 {key:"SharePath", title:"Share Path"}, {key:"ItemPath", title:"Item"},
 {key:"AccessControlType", title:"Type"}, {key:"AccessRights", title:"Rights"},
 {key:"IsInherited", title:"Inherited"}, {key:"RiskFlags", title:"Risk"},
-{key:"Status", title:"Status"}, {key:"Error", title:"Error"}
+{key:"SuggestedFix", title:"Suggested Fix"}, {key:"Status", title:"Status"}, {key:"Error", title:"Error"}
 ]
 },
 robo: {
@@ -1331,7 +1422,7 @@ function preferredColumns(keys) {
 const preferred = [
 "Dataset","RunId","Server","ShareName","SharePath","UNCPath","ItemPath","Depth","ScanDepth",
 "Principal","IdentityReference","AccountName","AccessSource","AccessControlType","AccessRight",
-"AccessRights","FileSystemRights","IsInherited","RiskLevel","RiskScore","RiskFlags","Reasons",
+"AccessRights","FileSystemRights","IsInherited","RiskLevel","RiskScore","RiskFlags","SuggestedFix","Reasons",
 "ScanStatus","Status","Error","SourceUNC","TargetUNC","RobocopyCommand"
 ];
 const seen = {};
@@ -1906,6 +1997,7 @@ AccessControlType: perm.AccessControlType,
 AccessRights: perm.AccessRight,
 IsInherited: "",
 RiskFlags: /Everyone|Authenticated Users|BUILTIN\\Users/.test(perm.AccountName) ? "BroadPrincipal" : "",
+SuggestedFix: "",
 Status: perm.Status,
 Error: perm.Error
 });
@@ -1924,6 +2016,7 @@ AccessControlType: acl.AccessControlType,
 AccessRights: acl.FileSystemRights,
 IsInherited: acl.IsInherited,
 RiskFlags: acl.RiskFlags,
+SuggestedFix: acl.SuggestedFix || "",
 Status: acl.ScanStatus,
 Error: acl.Error
 });
@@ -1945,6 +2038,7 @@ try {
 const raw = decodeBase64Utf8(document.getElementById("fst-data").textContent);
 DATA = JSON.parse(raw);
 ensureUserAccessRows();
+ensureSuggestedFixes();
 const sourceText = DATA.meta.sourceJsonFiles ? ` | JSON files: ${DATA.meta.sourceJsonFiles}` : "";
 document.getElementById("subtitle").textContent = `Scope: ${DATA.meta.server} | Generated: ${DATA.meta.generatedAt} | Run: ${DATA.meta.runId}${sourceText}`;
 const commandLink = DATA.meta.generateCentralDashboardCommand || "";

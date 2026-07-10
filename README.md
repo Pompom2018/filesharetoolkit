@@ -40,6 +40,16 @@ To generate a Pages-ready `docs/index.html`:
 
 Then push the repository to GitHub and enable GitHub Pages from the `docs` folder on the main branch.
 
+## NTFS Repair Guidance
+
+Problem ACL rows include a `SuggestedFix` column. The guidance is intentionally conservative:
+
+- Back up ACLs first, for example with `icacls <path> /save <backup-file> /t /c`.
+- Do not reset permissions unless you have an approved restore plan.
+- For access denied, run elevated or as the file server local admin/SYSTEM first.
+- If needed, take ownership only on the affected object, preferably to the Administrators group, then add a temporary admin ACE. This changes ownership/adds access without replacing the existing DACL.
+- Remove temporary admin access after cleanup if it is not part of the intended permission model.
+
 ## License And Donations
 
 This repository currently uses the GNU Lesser General Public License v2.1 because that license was selected when the GitHub repo was initialized.
