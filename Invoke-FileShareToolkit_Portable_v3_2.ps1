@@ -65,6 +65,13 @@ Output:
 -ConfigPath .\config\targets.json `
 -CentralJsonPath \\auditserver\ShareAudit\Json `
 -OpenDashboard
+
+.EXAMPLE
+.\Invoke-FileShareToolkit_Portable_v3_2.ps1 `
+-OutputPath C:\Temp\ShareAudit `
+-MaxAclDepth 1 `
+-RobocopyDiagnosticDestinationRoot \\netapp\migrationtest\RobocopyDiagnostics `
+-OpenDashboard
 #>
 
 [CmdletBinding()]
@@ -86,6 +93,14 @@ param(
 [string]$TargetServer = "TARGETSERVER",
 
 [int]$RobocopyThreads = 8,
+
+[string]$RobocopyDiagnosticDestinationRoot,
+
+[int]$MaxAccessDiagnosticGroups = 50,
+
+[int]$MaxDiagnosticFileSamplesPerFolder = 3,
+
+[switch]$SkipAccessDiagnostics,
 
 [string]$CentralJsonPath,
 
@@ -649,6 +664,687 @@ RobocopyCommand = $cmd
 return $rows
 }
 
+function Get-SafeFileNamePart {
+param([string]$Value)
+
+if ([string]::IsNullOrWhiteSpace($Value)) { return "Unknown" }
+return ($Value -replace '[\\/:*?"<>| ]','_')
+}
+
+function Get-AccessDiagnosticErrorSignature {
+param(
+[string]$Error,
+[string]$RiskFlags
+)
+
+$text = ([string]$Error).Trim()
+if ([string]::IsNullOrWhiteSpace($text)) {
+if (-not [string]::IsNullOrWhiteSpace($RiskFlags)) { return [string]$RiskFlags }
+return "Unknown"
+}
+
+if ($text -match 'Access is denied|UnauthorizedAccess|permission') { return "AccessDenied" }
+if ($text -match 'path.*too long|too long') { return "PathTooLong" }
+if ($text -match 'could not find|cannot find|not found') { return "PathNotFound" }
+if ($text -match 'being used by another process|lock') { return "LockedOrInUse" }
+if ($text -match 'network path|network name|semaphore|specified server') { return "NetworkOrSmb" }
+
+$clean = $text -replace '\s+', ' '
+if ($clean.Length -gt 120) { return $clean.Substring(0, 120) }
+return $clean
+}
+
+function Get-ChildFileSamples {
+param(
+[string]$Path,
+[int]$Limit
+)
+
+if ($Limit -le 0 -or [string]::IsNullOrWhiteSpace($Path)) { return @() }
+
+$samples = New-Object System.Collections.Generic.List[object]
+$seen = @{}
+
+try {
+$directFiles = @(Get-ChildItem -LiteralPath $Path -Force -File -ErrorAction Stop | Select-Object -First $Limit)
+foreach ($file in $directFiles) {
+if ($null -ne $file -and -not $seen.ContainsKey([string]$file.FullName)) {
+$seen[[string]$file.FullName] = $true
+$samples.Add($file)
+}
+}
+}
+catch {
+}
+
+if ($samples.Count -lt $Limit) {
+try {
+$recursiveFiles = @(Get-ChildItem -LiteralPath $Path -Force -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First $Limit)
+foreach ($file in $recursiveFiles) {
+if ($samples.Count -ge $Limit) { break }
+if ($null -ne $file -and -not $seen.ContainsKey([string]$file.FullName)) {
+$seen[[string]$file.FullName] = $true
+$samples.Add($file)
+}
+}
+}
+catch {
+}
+}
+
+return @($samples.ToArray())
+}
+
+function Test-DiagnosticFileAccess {
+param([string]$Path)
+
+$readSucceeded = $false
+$readError = $null
+$aclSucceeded = $false
+$aclError = $null
+$stream = $null
+
+try {
+$stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+$readSucceeded = $true
+}
+catch {
+$readError = $_.Exception.Message
+}
+finally {
+if ($null -ne $stream) { $stream.Dispose() }
+}
+
+try {
+Get-Acl -LiteralPath $Path -ErrorAction Stop | Out-Null
+$aclSucceeded = $true
+}
+catch {
+$aclError = $_.Exception.Message
+}
+
+return [pscustomobject]@{
+CanReadFile = $readSucceeded
+ReadError = $readError
+CanReadFileAcl = $aclSucceeded
+AclError = $aclError
+}
+}
+
+function Invoke-RobocopyDiagnosticRun {
+param(
+[string]$SourceDirectory,
+[string]$FileName,
+[string]$TestRoot,
+[string]$LogRoot,
+[string]$TestName,
+[string]$CopyFlags,
+[long]$SourceBytes
+)
+
+$testDestination = Join-Path $TestRoot $TestName
+$logFile = Join-Path $LogRoot "$TestName.log"
+New-Item -Path $testDestination -ItemType Directory -Force | Out-Null
+
+$arguments = @(
+$SourceDirectory,
+$testDestination,
+$FileName,
+"/COPY:$CopyFlags",
+"/DCOPY:DAT",
+"/R:0",
+"/W:0",
+"/FFT",
+"/NP",
+"/LOG:$logFile"
+)
+
+& robocopy.exe @arguments | Out-Null
+$exitCode = $LASTEXITCODE
+$destinationFile = Join-Path $testDestination $FileName
+$fileExists = Test-Path -LiteralPath $destinationFile -PathType Leaf -ErrorAction SilentlyContinue
+$destinationBytes = $null
+if ($fileExists) {
+try {
+$destinationBytes = (Get-Item -LiteralPath $destinationFile -ErrorAction Stop).Length
+}
+catch {
+$destinationBytes = $null
+}
+}
+
+return [pscustomobject]@{
+Test = $TestName
+CopyFlags = $CopyFlags
+ExitCode = $exitCode
+RobocopySuccess = ($exitCode -lt 8)
+DestinationExists = $fileExists
+SourceBytes = $SourceBytes
+DestinationBytes = $destinationBytes
+SizeMatches = ($fileExists -and $null -ne $destinationBytes -and $destinationBytes -eq $SourceBytes)
+DestinationFile = $destinationFile
+LogFile = $logFile
+}
+}
+
+function Get-RobocopyDiagnosticDiagnosis {
+param([object[]]$Results)
+
+$datResult = @($Results | Where-Object { $_.Test -eq "01-DAT" } | Select-Object -First 1)
+$datsResult = @($Results | Where-Object { $_.Test -eq "02-DATS" } | Select-Object -First 1)
+$datsoResult = @($Results | Where-Object { $_.Test -eq "03-DATSO" } | Select-Object -First 1)
+
+if ($datResult.Count -eq 0 -or $datsResult.Count -eq 0 -or $datsoResult.Count -eq 0) {
+return [pscustomobject]@{
+Category = "Incomplete"
+Diagnosis = "The isolated robocopy diagnostic did not complete all test modes."
+RecommendedFix = "Review the diagnostic logs and rerun the probe after confirming the source file and test destination are reachable."
+RecommendedCopyMode = ""
+}
+}
+
+if (-not [bool]$datResult[0].RobocopySuccess) {
+return [pscustomobject]@{
+Category = "DATFailed"
+Diagnosis = "The basic data, attributes, and timestamp copy failed."
+RecommendedFix = "This is not limited to NTFS permissions. Check source-file access, destination write access, SMB connectivity, file locks, path length, invalid names, and storage availability before changing ACLs."
+RecommendedCopyMode = ""
+}
+}
+
+if (-not [bool]$datsResult[0].RobocopySuccess) {
+return [pscustomobject]@{
+Category = "DATSFailed"
+Diagnosis = "DAT succeeded, but copying the DACL failed."
+RecommendedFix = "Data can be copied, but applying NTFS permissions fails. Look for malformed ACLs, unresolved or obsolete SIDs, local server accounts in ACLs, missing rights to write security descriptors, or destination NTFS security-style/SID-resolution issues."
+RecommendedCopyMode = ""
+}
+}
+
+if (-not [bool]$datsoResult[0].RobocopySuccess) {
+return [pscustomobject]@{
+Category = "DATSOFailed"
+Diagnosis = "DAT and DATS succeeded, but copying ownership failed."
+RecommendedFix = "The ACL is copyable, but owner preservation is the blocker. Owners may be unresolved SIDs, local accounts from the old file server, or identities the migration account cannot assign. Use /COPY:DATS for the migration pass, then repair owners deliberately where required."
+RecommendedCopyMode = "/COPY:DATS"
+}
+}
+
+return [pscustomobject]@{
+Category = "Passed"
+Diagnosis = "All isolated robocopy tests completed with non-failure exit codes."
+RecommendedFix = "The sampled file did not reproduce the original failure. Check whether the failure is intermittent, path-specific, only appears under a larger multithreaded job, or occurs on a different child item."
+RecommendedCopyMode = "/COPY:DATSOU"
+}
+}
+
+function Invoke-RobocopySecurityDiagnostic {
+param(
+[string]$SourceFile,
+[string]$DestinationRoot,
+[string]$ServerName,
+[string]$ShareName
+)
+
+$emptyResult = [ordered]@{
+RobocopyStatus = "Skipped"
+RobocopyDiagnosis = ""
+RobocopyRecommendedFix = ""
+RecommendedCopyMode = ""
+RobocopyTestRoot = ""
+RobocopyReportPath = ""
+RobocopyLogRoot = ""
+DatExitCode = ""
+DatsExitCode = ""
+DatsoExitCode = ""
+DatSuccess = ""
+DatsSuccess = ""
+DatsoSuccess = ""
+}
+
+if ([string]::IsNullOrWhiteSpace($DestinationRoot)) {
+$emptyResult["RobocopyDiagnosis"] = "Robocopy probe not run because -RobocopyDiagnosticDestinationRoot was not supplied."
+return [pscustomobject]$emptyResult
+}
+
+if ([string]::IsNullOrWhiteSpace($SourceFile) -or -not (Test-Path -LiteralPath $SourceFile -PathType Leaf -ErrorAction SilentlyContinue)) {
+$emptyResult["RobocopyStatus"] = "NoSampleFile"
+$emptyResult["RobocopyDiagnosis"] = "No accessible sample file was found for this failure scope."
+return [pscustomobject]$emptyResult
+}
+
+if ($null -eq (Get-Command robocopy.exe -ErrorAction SilentlyContinue)) {
+$emptyResult["RobocopyStatus"] = "RobocopyMissing"
+$emptyResult["RobocopyDiagnosis"] = "robocopy.exe was not found on this system."
+return [pscustomobject]$emptyResult
+}
+
+try {
+if (-not (Test-Path -LiteralPath $DestinationRoot -ErrorAction SilentlyContinue)) {
+New-Item -Path $DestinationRoot -ItemType Directory -Force -ErrorAction Stop | Out-Null
+}
+
+$sourceItem = Get-Item -LiteralPath $SourceFile -ErrorAction Stop
+$sourceDirectory = $sourceItem.DirectoryName
+$fileName = $sourceItem.Name
+$safeServer = Get-SafeFileNamePart -Value $ServerName
+$safeShare = Get-SafeFileNamePart -Value $ShareName
+$timeStamp = Get-Date -Format "yyyyMMdd-HHmmss"
+$testRoot = Join-Path $DestinationRoot ("SecurityTest-{0}-{1}-{2}" -f $safeServer, $safeShare, $timeStamp)
+$logRoot = Join-Path $testRoot "Logs"
+New-Item -Path $testRoot -ItemType Directory -Force -ErrorAction Stop | Out-Null
+New-Item -Path $logRoot -ItemType Directory -Force -ErrorAction Stop | Out-Null
+
+$aclReadSucceeded = $false
+$sourceAcl = $null
+$aclError = $null
+try {
+$sourceAcl = Get-Acl -LiteralPath $SourceFile -ErrorAction Stop
+$aclReadSucceeded = $true
+}
+catch {
+$aclError = $_.Exception.Message
+}
+
+$results = @()
+$results += Invoke-RobocopyDiagnosticRun -SourceDirectory $sourceDirectory -FileName $fileName -TestRoot $testRoot -LogRoot $logRoot -TestName "01-DAT" -CopyFlags "DAT" -SourceBytes $sourceItem.Length
+$results += Invoke-RobocopyDiagnosticRun -SourceDirectory $sourceDirectory -FileName $fileName -TestRoot $testRoot -LogRoot $logRoot -TestName "02-DATS" -CopyFlags "DATS" -SourceBytes $sourceItem.Length
+$results += Invoke-RobocopyDiagnosticRun -SourceDirectory $sourceDirectory -FileName $fileName -TestRoot $testRoot -LogRoot $logRoot -TestName "03-DATSO" -CopyFlags "DATSO" -SourceBytes $sourceItem.Length
+
+$diagnosis = Get-RobocopyDiagnosticDiagnosis -Results $results
+$resultCsv = Join-Path $testRoot "Robocopy-Test-Results.csv"
+$reportFile = Join-Path $testRoot "Robocopy-Diagnosis.txt"
+$results | Export-Csv -Path $resultCsv -NoTypeInformation -Encoding UTF8
+
+$sourceOwner = ""
+$sourceGroup = ""
+$protectedAcl = ""
+if ($null -ne $sourceAcl) {
+$sourceOwner = [string]$sourceAcl.Owner
+$sourceGroup = [string]$sourceAcl.Group
+$protectedAcl = [string]$sourceAcl.AreAccessRulesProtected
+}
+
+@"
+Robocopy security diagnostic
+Generated: $(Get-Date)
+
+Source:
+$SourceFile
+
+Destination test root:
+$testRoot
+
+Source ACL readable:
+$aclReadSucceeded
+
+Source ACL error:
+$aclError
+
+Source owner:
+$sourceOwner
+
+Source group:
+$sourceGroup
+
+Protected ACL:
+$protectedAcl
+
+Results:
+$($results | Format-Table Test, CopyFlags, ExitCode, RobocopySuccess, DestinationExists, SizeMatches -AutoSize | Out-String)
+
+Diagnosis:
+$($diagnosis.Diagnosis)
+
+Recommended fix:
+$($diagnosis.RecommendedFix)
+"@ | Set-Content -Path $reportFile -Encoding UTF8
+
+$dat = @($results | Where-Object { $_.Test -eq "01-DAT" } | Select-Object -First 1)
+$dats = @($results | Where-Object { $_.Test -eq "02-DATS" } | Select-Object -First 1)
+$datso = @($results | Where-Object { $_.Test -eq "03-DATSO" } | Select-Object -First 1)
+
+$output = [ordered]@{}
+foreach ($entry in $emptyResult.GetEnumerator()) {
+$output[$entry.Key] = $entry.Value
+}
+$output["RobocopyStatus"] = "Completed"
+$output["RobocopyDiagnosis"] = [string]$diagnosis.Diagnosis
+$output["RobocopyRecommendedFix"] = [string]$diagnosis.RecommendedFix
+$output["RecommendedCopyMode"] = [string]$diagnosis.RecommendedCopyMode
+$output["RobocopyTestRoot"] = $testRoot
+$output["RobocopyReportPath"] = $reportFile
+$output["RobocopyLogRoot"] = $logRoot
+$output["DatExitCode"] = if ($dat.Count -gt 0) { [string]$dat[0].ExitCode } else { "" }
+$output["DatsExitCode"] = if ($dats.Count -gt 0) { [string]$dats[0].ExitCode } else { "" }
+$output["DatsoExitCode"] = if ($datso.Count -gt 0) { [string]$datso[0].ExitCode } else { "" }
+$output["DatSuccess"] = if ($dat.Count -gt 0) { [string]$dat[0].RobocopySuccess } else { "" }
+$output["DatsSuccess"] = if ($dats.Count -gt 0) { [string]$dats[0].RobocopySuccess } else { "" }
+$output["DatsoSuccess"] = if ($datso.Count -gt 0) { [string]$datso[0].RobocopySuccess } else { "" }
+return [pscustomobject]$output
+}
+catch {
+$emptyResult["RobocopyStatus"] = "Failed"
+$emptyResult["RobocopyDiagnosis"] = $_.Exception.Message
+$emptyResult["RobocopyRecommendedFix"] = "Confirm the diagnostic destination is writable and that the sampled source file is reachable, then rerun the audit."
+return [pscustomobject]$emptyResult
+}
+}
+
+function Get-AccessDiagnosticAdvice {
+param(
+[string]$RiskFlags,
+[string]$ErrorSignature,
+[string]$PathType,
+[bool]$AclReadable,
+[bool]$CanEnumerate,
+[int]$SampleFileCount,
+[int]$SampleFileErrors,
+[int]$UnresolvedAceCount,
+[int]$LocalIdentityCount,
+[string]$Owner,
+[object]$RobocopyProbe
+)
+
+$causes = New-Object System.Collections.Generic.List[string]
+$fixes = New-Object System.Collections.Generic.List[string]
+
+if ($RiskFlags -match "PathNotFound" -or $ErrorSignature -eq "PathNotFound") {
+$causes.Add("The path was not found or was invisible to the audit account.")
+$fixes.Add("Verify the share path, DFS target, mount point, and account visibility before changing permissions.")
+}
+
+if ($RiskFlags -match "EnumerationFailed") {
+$causes.Add("The folder could not be enumerated.")
+$fixes.Add("Check List Folder/Read Data and Traverse Folder rights on this scope and its parent. Fix the first blocked folder rather than changing every child.")
+}
+
+if ($RiskFlags -match "AclReadDenied" -or $ErrorSignature -eq "AccessDenied" -or -not $AclReadable) {
+$causes.Add("The object exists, but the audit account could not read its security descriptor.")
+$fixes.Add("Do not reset ACLs. Back up permissions first with icacls /save, rerun elevated or as local admin/SYSTEM, then take ownership only on this scope and add a temporary admin ACE if needed.")
+}
+
+if ($PathType -eq "Folder" -and -not $CanEnumerate) {
+$causes.Add("The folder itself could not be listed.")
+$fixes.Add("Repair access at this folder or the nearest parent so one inherited fix can unblock the children.")
+}
+
+if ($SampleFileCount -gt 0 -and $SampleFileErrors -eq $SampleFileCount) {
+$causes.Add("All sampled child files failed read or ACL checks.")
+$fixes.Add("Treat this as a folder-level inheritance or ownership problem. Fix the folder or first bad child, then rerun instead of chasing every file error.")
+}
+
+if ($UnresolvedAceCount -gt 0) {
+$causes.Add("Visible ACL entries contain unresolved SIDs.")
+$fixes.Add("Map unresolved SIDs to migrated identities where possible. Remove only obsolete ACEs after the ACL backup.")
+}
+
+if ($LocalIdentityCount -gt 0) {
+$causes.Add("Visible ACL entries contain local machine accounts.")
+$fixes.Add("Replace local-server principals with approved domain groups before migration to storage that cannot resolve the old local accounts.")
+}
+
+if ($Owner -match '^S-\d-') {
+$causes.Add("The owner is an unresolved SID.")
+$fixes.Add("Set ownership only on the affected scope to an approved admin or data-owner group after backing up ACLs; do not replace the existing DACL.")
+}
+
+$computerName = [string]$env:COMPUTERNAME
+if (-not [string]::IsNullOrWhiteSpace($computerName) -and $Owner -like "$computerName\*") {
+$causes.Add("The owner is a local account from this file server.")
+$fixes.Add("Move ownership to a domain group or service account that will exist on the destination, then rerun the diagnostic.")
+}
+
+if ($null -ne $RobocopyProbe -and [string]$RobocopyProbe.RobocopyStatus -eq "Completed") {
+$causes.Add([string]$RobocopyProbe.RobocopyDiagnosis)
+$fixes.Add([string]$RobocopyProbe.RobocopyRecommendedFix)
+}
+elseif ($null -ne $RobocopyProbe -and -not [string]::IsNullOrWhiteSpace([string]$RobocopyProbe.RobocopyDiagnosis)) {
+$causes.Add([string]$RobocopyProbe.RobocopyDiagnosis)
+}
+
+if ($causes.Count -eq 0) {
+$causes.Add("The failure needs manual review; the sampled checks did not isolate one clear root cause.")
+}
+
+if ($fixes.Count -eq 0) {
+$fixes.Add("Back up ACLs first, make the smallest reversible change at the highest affected folder, then rerun the audit.")
+}
+
+return [pscustomobject]@{
+LikelyCause = (($causes | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Sort-Object -Unique) -join " ")
+RecommendedFix = (($fixes | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Sort-Object -Unique) -join " ")
+}
+}
+
+function Get-AccessDiagnosticRows {
+param(
+[object[]]$NtfsAcls,
+[string]$DestinationRoot,
+[int]$MaxGroups,
+[int]$MaxFileSamplesPerFolder
+)
+
+$failedRows = @($NtfsAcls | Where-Object { [string]$_.ScanStatus -eq "Failed" })
+if ($failedRows.Count -eq 0) { return @() }
+
+$groups = @{}
+$groupOrder = New-Object System.Collections.Generic.List[string]
+
+foreach ($row in $failedRows) {
+$scopePath = [string]$row.ItemPath
+if ([string]::IsNullOrWhiteSpace($scopePath)) { $scopePath = [string]$row.SharePath }
+$riskFlags = [string]$row.RiskFlags
+$errorSignature = Get-AccessDiagnosticErrorSignature -Error ([string]$row.Error) -RiskFlags $riskFlags
+$key = "{0}|{1}|{2}|{3}|{4}" -f ([string]$row.Server), ([string]$row.ShareName), $scopePath.ToLowerInvariant(), $riskFlags, $errorSignature
+
+if (-not $groups.ContainsKey($key)) {
+$groups[$key] = [ordered]@{
+Row = $row
+ScopePath = $scopePath
+RiskFlags = $riskFlags
+ErrorSignature = $errorSignature
+FailureCount = 0
+}
+$groupOrder.Add($key)
+}
+
+$groups[$key]["FailureCount"] = [int]$groups[$key]["FailureCount"] + 1
+}
+
+$rows = New-Object System.Collections.Generic.List[object]
+$processed = 0
+
+foreach ($key in $groupOrder) {
+if ($processed -ge $MaxGroups) { break }
+
+$group = $groups[$key]
+$sourceRow = $group["Row"]
+$scopePath = [string]$group["ScopePath"]
+$riskFlags = [string]$group["RiskFlags"]
+$errorSignature = [string]$group["ErrorSignature"]
+$processed++
+
+Write-Log "Running access diagnostic for $($sourceRow.ShareName): $scopePath"
+
+$pathExists = Test-Path -LiteralPath $scopePath -ErrorAction SilentlyContinue
+$pathType = "NotAccessibleOrMissing"
+if (Test-Path -LiteralPath $scopePath -PathType Container -ErrorAction SilentlyContinue) {
+$pathType = "Folder"
+}
+elseif (Test-Path -LiteralPath $scopePath -PathType Leaf -ErrorAction SilentlyContinue) {
+$pathType = "File"
+}
+elseif ($pathExists) {
+$pathType = "Other"
+}
+
+$owner = ""
+$groupName = ""
+$inheritanceProtected = ""
+$aclReadable = $false
+$aclError = ""
+$unresolvedAceCount = 0
+$localIdentityCount = 0
+
+try {
+$acl = Get-Acl -LiteralPath $scopePath -ErrorAction Stop
+$aclReadable = $true
+$owner = [string]$acl.Owner
+$groupName = [string]$acl.Group
+$inheritanceProtected = [string]$acl.AreAccessRulesProtected
+$unresolvedAceCount = @($acl.Access | Where-Object { [string]$_.IdentityReference.Value -match '^S-\d-' }).Count
+$computerName = [string]$env:COMPUTERNAME
+if (-not [string]::IsNullOrWhiteSpace($computerName)) {
+$localIdentityCount = @($acl.Access | Where-Object { [string]$_.IdentityReference.Value -like "$computerName\*" }).Count
+}
+}
+catch {
+$aclError = $_.Exception.Message
+}
+
+$canEnumerate = $false
+$directFileCount = ""
+$directFolderCount = ""
+$sampleFiles = @()
+$sampleFileCount = 0
+$sampleFileErrors = 0
+$sampleFileErrorSummary = ""
+
+if ($pathType -eq "Folder") {
+try {
+$directChildren = @(Get-ChildItem -LiteralPath $scopePath -Force -ErrorAction Stop)
+$canEnumerate = $true
+$directFileCount = @($directChildren | Where-Object { -not $_.PSIsContainer }).Count
+$directFolderCount = @($directChildren | Where-Object { $_.PSIsContainer }).Count
+}
+catch {
+$sampleFileErrorSummary = $_.Exception.Message
+}
+
+$sampleFiles = @(Get-ChildFileSamples -Path $scopePath -Limit $MaxFileSamplesPerFolder)
+}
+elseif ($pathType -eq "File") {
+try {
+$sampleFiles = @(Get-Item -LiteralPath $scopePath -ErrorAction Stop)
+}
+catch {
+$sampleFiles = @()
+}
+}
+
+$fileErrors = New-Object System.Collections.Generic.List[string]
+foreach ($file in @($sampleFiles)) {
+$sampleFileCount++
+$fileAccess = Test-DiagnosticFileAccess -Path ([string]$file.FullName)
+if (-not $fileAccess.CanReadFile -or -not $fileAccess.CanReadFileAcl) {
+$sampleFileErrors++
+if (-not [string]::IsNullOrWhiteSpace([string]$fileAccess.ReadError)) { $fileErrors.Add([string]$fileAccess.ReadError) }
+if (-not [string]::IsNullOrWhiteSpace([string]$fileAccess.AclError)) { $fileErrors.Add([string]$fileAccess.AclError) }
+}
+}
+
+if ($fileErrors.Count -gt 0) {
+$sampleFileErrorSummary = (($fileErrors.ToArray() | Sort-Object -Unique) -join " ")
+}
+
+$sampleFile = ""
+if ($sampleFiles.Count -gt 0) {
+$sampleFile = [string]$sampleFiles[0].FullName
+}
+
+$robocopyProbe = Invoke-RobocopySecurityDiagnostic -SourceFile $sampleFile -DestinationRoot $DestinationRoot -ServerName ([string]$sourceRow.Server) -ShareName ([string]$sourceRow.ShareName)
+$advice = Get-AccessDiagnosticAdvice -RiskFlags $riskFlags -ErrorSignature $errorSignature -PathType $pathType -AclReadable $aclReadable -CanEnumerate $canEnumerate -SampleFileCount $sampleFileCount -SampleFileErrors $sampleFileErrors -UnresolvedAceCount $unresolvedAceCount -LocalIdentityCount $localIdentityCount -Owner $owner -RobocopyProbe $robocopyProbe
+
+$rows.Add([pscustomobject]@{
+Server = [string]$sourceRow.Server
+ShareName = [string]$sourceRow.ShareName
+SharePath = [string]$sourceRow.SharePath
+ScopePath = $scopePath
+Depth = $sourceRow.Depth
+ScanDepth = $sourceRow.ScanDepth
+EffectiveAclDepth = $sourceRow.EffectiveAclDepth
+FailureCount = [int]$group["FailureCount"]
+RiskFlags = $riskFlags
+ErrorSignature = $errorSignature
+OriginalError = [string]$sourceRow.Error
+PathExists = [string]$pathExists
+PathType = $pathType
+CanReadAcl = [string]$aclReadable
+AclError = $aclError
+CanEnumerate = [string]$canEnumerate
+Owner = $owner
+Group = $groupName
+InheritanceProtected = $inheritanceProtected
+UnresolvedAceCount = $unresolvedAceCount
+LocalIdentityCount = $localIdentityCount
+DirectFileCount = $directFileCount
+DirectFolderCount = $directFolderCount
+SampleFile = $sampleFile
+SampleFileCount = $sampleFileCount
+SampleFileErrors = $sampleFileErrors
+SampleFileErrorSummary = $sampleFileErrorSummary
+RobocopyStatus = [string]$robocopyProbe.RobocopyStatus
+RobocopyDiagnosis = [string]$robocopyProbe.RobocopyDiagnosis
+RecommendedCopyMode = [string]$robocopyProbe.RecommendedCopyMode
+DatExitCode = [string]$robocopyProbe.DatExitCode
+DatsExitCode = [string]$robocopyProbe.DatsExitCode
+DatsoExitCode = [string]$robocopyProbe.DatsoExitCode
+RobocopyTestRoot = [string]$robocopyProbe.RobocopyTestRoot
+RobocopyReportPath = [string]$robocopyProbe.RobocopyReportPath
+RobocopyLogRoot = [string]$robocopyProbe.RobocopyLogRoot
+LikelyCause = [string]$advice.LikelyCause
+RecommendedFix = [string]$advice.RecommendedFix
+})
+}
+
+$remaining = $groupOrder.Count - $processed
+if ($remaining -gt 0) {
+$rows.Add([pscustomobject]@{
+Server = ""
+ShareName = ""
+SharePath = ""
+ScopePath = "Diagnostic group cap reached"
+Depth = ""
+ScanDepth = ""
+EffectiveAclDepth = ""
+FailureCount = $remaining
+RiskFlags = "DiagnosticLimit"
+ErrorSignature = "MaxAccessDiagnosticGroups"
+OriginalError = ""
+PathExists = ""
+PathType = ""
+CanReadAcl = ""
+AclError = ""
+CanEnumerate = ""
+Owner = ""
+Group = ""
+InheritanceProtected = ""
+UnresolvedAceCount = ""
+LocalIdentityCount = ""
+DirectFileCount = ""
+DirectFolderCount = ""
+SampleFile = ""
+SampleFileCount = ""
+SampleFileErrors = ""
+SampleFileErrorSummary = ""
+RobocopyStatus = "Skipped"
+RobocopyDiagnosis = "Increase -MaxAccessDiagnosticGroups to inspect the remaining failure groups."
+RecommendedCopyMode = ""
+DatExitCode = ""
+DatsExitCode = ""
+DatsoExitCode = ""
+RobocopyTestRoot = ""
+RobocopyReportPath = ""
+RobocopyLogRoot = ""
+LikelyCause = "More unique access failure groups were found than the configured diagnostic cap."
+RecommendedFix = "Fix the listed higher-level scopes first, then rerun. If more detail is needed, increase -MaxAccessDiagnosticGroups."
+})
+}
+
+return @($rows.ToArray())
+}
+
 function Convert-ForJson {
 param([object[]]$Rows)
 
@@ -834,6 +1530,7 @@ td, th { color:#000; white-space:normal; }
 <div class="tab active" onclick="showTab('risk')">Risk</div>
 <div class="tab" onclick="showTab('shares')">Shares</div>
 <div class="tab" onclick="showTab('acls')">Problem ACLs</div>
+<div class="tab" onclick="showTab('diag')">Diagnostics</div>
 <div class="tab" onclick="showTab('perms')">Share Permissions</div>
 <div class="tab" onclick="showTab('users')">User Access</div>
 <div class="tab" onclick="showTab('robo')">Robocopy</div>
@@ -875,6 +1572,16 @@ td, th { color:#000; white-space:normal; }
 <span class="row-count" id="aclsCount"></span>
 </div>
 <div class="table-wrap"><table id="aclTable"></table></div>
+</section>
+
+<section id="tab-diag" class="section hidden">
+<h2>Access Diagnostics</h2>
+<div class="controls">
+<input id="diagSearch" placeholder="Search diagnostics..." oninput="renderTable('diag')">
+<button type="button" onclick="clearFilters('diag')">Clear filters</button>
+<span class="row-count" id="diagCount"></span>
+</div>
+<div class="table-wrap"><table id="diagTable"></table></div>
 </section>
 
 <section id="tab-perms" class="section hidden">
@@ -1039,6 +1746,7 @@ function renderCards() {
 const shares = rowsOf(DATA.shares);
 const acls = rowsOf(DATA.ntfsAcls);
 const risk = rowsOf(DATA.risk);
+const diagnostics = rowsOf(DATA.accessDiagnostics);
 const servers = new Set([
 ...shares.map(r => r.Server),
 ...rowsOf(DATA.summary).map(r => r.Server)
@@ -1049,6 +1757,7 @@ const cards = [
 ["Total Shares", shares.length, ""],
 ["ACL Rows", acls.length, ""],
 ["Failed ACL Rows", count(acls, r => r.ScanStatus === "Failed"), "warn"],
+["Access Diagnostics", diagnostics.length, diagnostics.length ? "warn" : "ok"],
 ["Critical Risk", count(risk, r => r.RiskLevel === "Critical"), "bad"],
 ["High Risk", count(risk, r => r.RiskLevel === "High"), "bad"],
 ["Medium Risk", count(risk, r => r.RiskLevel === "Medium"), "warn"],
@@ -1077,6 +1786,7 @@ const LEGACY_CSV_FILE_ROWS = [
 {File:"SMB_Shares.csv", Description:"Discovered SMB shares"},
 {File:"SMB_Share_Permissions.csv", Description:"Share-level permissions"},
 {File:"NTFS_ACLs.csv", Description:"NTFS ACL inventory"},
+{File:"Access_Diagnostics.csv", Description:"Aggregated access failure diagnostics and repair advice"},
 {File:"Migration_Risk_Assessment.csv", Description:"Risk scores and reasons"},
 {File:"User_Access.csv", Description:"Flattened principal access view"},
 {File:"Robocopy_Migration_Plan.csv", Description:"Generated robocopy commands"}
@@ -1133,6 +1843,25 @@ cols:[
 {key:"FileSystemRights", title:"Rights"}, {key:"IsInherited", title:"Inherited"},
 {key:"RiskFlags", title:"Risk"}, {key:"SuggestedFix", title:"Suggested Fix"},
 {key:"ScanStatus", title:"Status"}, {key:"Error", title:"Error"}
+]
+},
+diag: {
+tableId:"diagTable", searchId:"diagSearch", countId:"diagCount",
+rows:() => rowsOf(DATA.accessDiagnostics),
+defaultSort:{key:"FailureCount", dir:"desc"},
+cols:[
+{key:"Server", title:"Server"}, {key:"ShareName", title:"Share"},
+{key:"ScopePath", title:"Scope"}, {key:"Depth", title:"Depth"},
+{key:"FailureCount", title:"Failures"}, {key:"RiskFlags", title:"Risk"},
+{key:"ErrorSignature", title:"Error Type"}, {key:"PathType", title:"Path Type"},
+{key:"CanReadAcl", title:"ACL Readable"}, {key:"CanEnumerate", title:"Enumerable"},
+{key:"Owner", title:"Owner"}, {key:"UnresolvedAceCount", title:"Unresolved ACEs"},
+{key:"LocalIdentityCount", title:"Local ACEs"}, {key:"SampleFile", title:"Sample File"},
+{key:"SampleFileErrors", title:"Sample Errors"}, {key:"RobocopyStatus", title:"Robocopy"},
+{key:"RecommendedCopyMode", title:"Copy Mode"}, {key:"DatExitCode", title:"DAT"},
+{key:"DatsExitCode", title:"DATS"}, {key:"DatsoExitCode", title:"DATSO"},
+{key:"LikelyCause", title:"Likely Cause"}, {key:"RecommendedFix", title:"Recommended Fix"},
+{key:"RobocopyReportPath", title:"Report"}, {key:"RobocopyLogRoot", title:"Logs"}
 ]
 },
 perms: {
@@ -1399,6 +2128,7 @@ return [
 {name:"Shares", rows:rowsOf(DATA.shares)},
 {name:"SharePermissions", rows:rowsOf(DATA.sharePermissions)},
 {name:"NtfsAcls", rows:rowsOf(DATA.ntfsAcls)},
+{name:"AccessDiagnostics", rows:rowsOf(DATA.accessDiagnostics)},
 {name:"Risk", rows:rowsOf(DATA.risk)},
 {name:"UserAccess", rows:rowsOf(DATA.userAccess)},
 {name:"RobocopyPlan", rows:rowsOf(DATA.robocopyPlan)},
@@ -1420,10 +2150,12 @@ return text;
 
 function preferredColumns(keys) {
 const preferred = [
-"Dataset","RunId","Server","ShareName","SharePath","UNCPath","ItemPath","Depth","ScanDepth",
+"Dataset","RunId","Server","ShareName","SharePath","UNCPath","ItemPath","ScopePath","Depth","ScanDepth",
 "Principal","IdentityReference","AccountName","AccessSource","AccessControlType","AccessRight",
 "AccessRights","FileSystemRights","IsInherited","RiskLevel","RiskScore","RiskFlags","SuggestedFix","Reasons",
-"ScanStatus","Status","Error","SourceUNC","TargetUNC","RobocopyCommand"
+"FailureCount","ErrorSignature","LikelyCause","RecommendedFix","ScanStatus","Status","Error","OriginalError",
+"RobocopyStatus","RecommendedCopyMode","DatExitCode","DatsExitCode","DatsoExitCode","RobocopyReportPath",
+"SourceUNC","TargetUNC","RobocopyCommand"
 ];
 const seen = {};
 const ordered = [];
@@ -1880,6 +2612,8 @@ const configPath = meta.configTargetPath || meta.configPath || ".\\config\\targe
 let command = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "' + script + '" -ConfigPath "' + configPath + '"';
 if (meta.centralJsonPath) command += ' -CentralJsonPath "' + meta.centralJsonPath + '"';
 if (meta.targetServer) command += ' -TargetServer "' + meta.targetServer + '"';
+if (meta.robocopyDiagnosticDestinationRoot) command += ' -RobocopyDiagnosticDestinationRoot "' + meta.robocopyDiagnosticDestinationRoot + '"';
+if (meta.skipAccessDiagnostics) command += " -SkipAccessDiagnostics";
 command += " -OpenDashboard";
 return command;
 }
@@ -2431,6 +3165,7 @@ $summaryRows = New-Object System.Collections.Generic.List[object]
 $shareRows = New-Object System.Collections.Generic.List[object]
 $sharePermissionRows = New-Object System.Collections.Generic.List[object]
 $ntfsAclRows = New-Object System.Collections.Generic.List[object]
+$accessDiagnosticRows = New-Object System.Collections.Generic.List[object]
 $riskRows = New-Object System.Collections.Generic.List[object]
 $userAccessRows = New-Object System.Collections.Generic.List[object]
 $robocopyRows = New-Object System.Collections.Generic.List[object]
@@ -2461,6 +3196,7 @@ $ntfsAcls = @(Get-JsonArrayProperty -Object $data -Name "ntfsAcls")
 Add-ListRows -Target $shareRows -Rows $shares
 Add-ListRows -Target $sharePermissionRows -Rows $sharePermissions
 Add-ListRows -Target $ntfsAclRows -Rows $ntfsAcls
+Add-ListRows -Target $accessDiagnosticRows -Rows (Get-JsonArrayProperty -Object $data -Name "accessDiagnostics")
 Add-ListRows -Target $riskRows -Rows (Get-JsonArrayProperty -Object $data -Name "risk")
 Add-ListRows -Target $robocopyRows -Rows (Get-JsonArrayProperty -Object $data -Name "robocopyPlan")
 
@@ -2536,6 +3272,7 @@ summary = @(Convert-ForJson ($summaryRows.ToArray()))
 shares = @(Convert-ForJson ($shareRows.ToArray()))
 sharePermissions = @(Convert-ForJson ($sharePermissionRows.ToArray()))
 ntfsAcls = @(Convert-ForJson ($ntfsAclRows.ToArray()))
+accessDiagnostics = @(Convert-ForJson ($accessDiagnosticRows.ToArray()))
 risk = @(Convert-ForJson ($riskRows.ToArray()))
 userAccess = @(Convert-ForJson ($userAccessRows.ToArray()))
 robocopyPlan = @(Convert-ForJson ($robocopyRows.ToArray()))
@@ -2551,6 +3288,7 @@ Export-CsvSafe -Data @(Get-JsonArrayProperty -Object $Data -Name "summary") -Nam
 Export-CsvSafe -Data @(Get-JsonArrayProperty -Object $Data -Name "shares") -Name "SMB_Shares.csv" | Out-Null
 Export-CsvSafe -Data @(Get-JsonArrayProperty -Object $Data -Name "sharePermissions") -Name "SMB_Share_Permissions.csv" | Out-Null
 Export-CsvSafe -Data @(Get-JsonArrayProperty -Object $Data -Name "ntfsAcls") -Name "NTFS_ACLs.csv" | Out-Null
+Export-CsvSafe -Data @(Get-JsonArrayProperty -Object $Data -Name "accessDiagnostics") -Name "Access_Diagnostics.csv" | Out-Null
 Export-CsvSafe -Data @(Get-JsonArrayProperty -Object $Data -Name "risk") -Name "Migration_Risk_Assessment.csv" | Out-Null
 Export-CsvSafe -Data @(Get-JsonArrayProperty -Object $Data -Name "userAccess") -Name "User_Access.csv" | Out-Null
 Export-CsvSafe -Data @(Get-JsonArrayProperty -Object $Data -Name "robocopyPlan") -Name "Robocopy_Migration_Plan.csv" | Out-Null
@@ -2972,6 +3710,12 @@ Write-Log "Output folder: $RunRoot"
 Write-Log "MaxAclDepth: $MaxAclDepth"
 Write-Log "TargetServer: $TargetServer"
 Write-Log "ExportCsvFiles: $ExportCsvFiles"
+Write-Log "SkipAccessDiagnostics: $SkipAccessDiagnostics"
+Write-Log "MaxAccessDiagnosticGroups: $MaxAccessDiagnosticGroups"
+Write-Log "MaxDiagnosticFileSamplesPerFolder: $MaxDiagnosticFileSamplesPerFolder"
+if (-not [string]::IsNullOrWhiteSpace($RobocopyDiagnosticDestinationRoot)) {
+Write-Log "RobocopyDiagnosticDestinationRoot: $RobocopyDiagnosticDestinationRoot"
+}
 if (-not [string]::IsNullOrWhiteSpace($ConfigPath)) {
 Write-Log "ConfigPath: $ConfigPath"
 }
@@ -2995,6 +3739,20 @@ if (-not $SkipSharePermissions) {
 $sharePermissions = Get-SharePermissions -Shares @($shares)
 }
 $ntfsAcls = Get-NtfsAclRows -Shares @($shares) -Depth $MaxAclDepth
+$accessDiagnostics = @()
+if (-not $SkipAccessDiagnostics) {
+$failedAclCount = @($ntfsAcls | Where-Object { $_.ScanStatus -eq "Failed" }).Count
+if ($failedAclCount -gt 0) {
+Write-Log "Generating access diagnostics for $failedAclCount failed ACL rows."
+$accessDiagnostics = Get-AccessDiagnosticRows -NtfsAcls @($ntfsAcls) -DestinationRoot $RobocopyDiagnosticDestinationRoot -MaxGroups $MaxAccessDiagnosticGroups -MaxFileSamplesPerFolder $MaxDiagnosticFileSamplesPerFolder
+}
+else {
+Write-Log "No failed ACL rows found; access diagnostics are not needed."
+}
+}
+else {
+Write-Log "Access diagnostics skipped by -SkipAccessDiagnostics."
+}
 $risk = Get-RiskAssessment -Shares @($shares) -SharePermissions @($sharePermissions) -NtfsAcls @($ntfsAcls)
 $robocopyPlan = Get-RobocopyPlan -Shares @($shares) -Target $TargetServer -Threads $RobocopyThreads
 $userAccess = Get-UserAccessRows -Shares @($shares) -SharePermissions @($sharePermissions) -NtfsAcls @($ntfsAcls)
@@ -3013,6 +3771,7 @@ Shares = @($shares).Count
 SharePermissionRows = @($sharePermissions).Count
 NtfsAclRows = @($ntfsAcls).Count
 FailedAclRows = @($ntfsAcls | Where-Object { $_.ScanStatus -eq "Failed" }).Count
+AccessDiagnosticRows = @($accessDiagnostics).Count
 RiskRows = @($risk).Count
 RobocopyRows = @($robocopyPlan).Count
 UserAccessRows = @($userAccess).Count
@@ -3023,6 +3782,7 @@ Export-CsvSafe -Data @($summary) -Name "Summary.csv" | Out-Null
 Export-CsvSafe -Data @($shares) -Name "SMB_Shares.csv" | Out-Null
 Export-CsvSafe -Data @($sharePermissions) -Name "SMB_Share_Permissions.csv" | Out-Null
 Export-CsvSafe -Data @($ntfsAcls) -Name "NTFS_ACLs.csv" | Out-Null
+Export-CsvSafe -Data @($accessDiagnostics) -Name "Access_Diagnostics.csv" | Out-Null
 Export-CsvSafe -Data @($risk) -Name "Migration_Risk_Assessment.csv" | Out-Null
 Export-CsvSafe -Data @($userAccess) -Name "User_Access.csv" | Out-Null
 Export-CsvSafe -Data @($robocopyPlan) -Name "Robocopy_Migration_Plan.csv" | Out-Null
@@ -3039,6 +3799,10 @@ configDefaultScanDepth = $configDefaultScanDepth
 configPath = $ConfigPath
 centralJsonPath = $CentralJsonPath
 targetServer = $TargetServer
+robocopyDiagnosticDestinationRoot = $RobocopyDiagnosticDestinationRoot
+skipAccessDiagnostics = [bool]$SkipAccessDiagnostics
+maxAccessDiagnosticGroups = $MaxAccessDiagnosticGroups
+maxDiagnosticFileSamplesPerFolder = $MaxDiagnosticFileSamplesPerFolder
 scriptFileName = (Split-Path -Path $ScriptPath -Leaf)
 scriptPath = $ScriptPath
 exportCsvFiles = [bool]$ExportCsvFiles
@@ -3047,6 +3811,7 @@ summary = @(Convert-ForJson @($summary))
 shares = @(Convert-ForJson @($shares))
 sharePermissions = @(Convert-ForJson @($sharePermissions))
 ntfsAcls = @(Convert-ForJson @($ntfsAcls))
+accessDiagnostics = @(Convert-ForJson @($accessDiagnostics))
 risk = @(Convert-ForJson @($risk))
 userAccess = @(Convert-ForJson @($userAccess))
 robocopyPlan = @(Convert-ForJson @($robocopyPlan))

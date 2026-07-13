@@ -11,10 +11,15 @@ Portable Windows file share discovery and NTFS permission audit dashboard.
   -OutputPath C:\Temp\ShareAudit `
   -MaxAclDepth 1 `
   -CentralJsonPath \\auditserver\ShareAudit\Json `
+  -RobocopyDiagnosticDestinationRoot \\netapp\migrationtest\RobocopyDiagnostics `
   -OpenDashboard
 ```
 
 Each server writes its local run output and copies a central JSON file to the shared folder.
+
+Access diagnostics run automatically when ACL scanning hits inaccessible paths. The rows are aggregated by failing scope and error type, so one bad folder with many child errors becomes one repair target instead of hundreds of duplicate findings.
+
+`-RobocopyDiagnosticDestinationRoot` is optional. When supplied, the toolkit samples the failing scope and runs isolated `robocopy` tests for `/COPY:DAT`, `/COPY:DATS`, and `/COPY:DATSO` into that test folder. Without it, the dashboard still shows ACL, enumeration, owner, SID, and sampled child-file diagnostics.
 
 ## Generate The Central Dashboard
 
@@ -49,6 +54,12 @@ Problem ACL rows include a `SuggestedFix` column. The guidance is intentionally 
 - For access denied, run elevated or as the file server local admin/SYSTEM first.
 - If needed, take ownership only on the affected object, preferably to the Administrators group, then add a temporary admin ACE. This changes ownership/adds access without replacing the existing DACL.
 - Remove temporary admin access after cleanup if it is not part of the intended permission model.
+
+The Access Diagnostics tab adds `LikelyCause`, `RecommendedFix`, and robocopy probe results where available:
+
+- `DAT` fails: basic data copy failed; check source access, destination write access, SMB, locks, path length, and storage availability before changing ACLs.
+- `DATS` fails after `DAT` succeeds: data can copy, but applying the DACL failed; investigate malformed ACLs, unresolved SIDs, old local accounts, and destination security-style/SID-resolution issues.
+- `DATSO` fails after `DAT` and `DATS` succeed: owner preservation is the blocker; use `/COPY:DATS` for the migration pass and repair ownership deliberately where required.
 
 ## License And Donations
 
